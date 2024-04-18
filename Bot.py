@@ -6,6 +6,8 @@ from enum import Enum
 import time
 from typing import List, Tuple, Dict
 import math
+import chess.pgn as cpgn
+import threading
 
 # write chess bot, with the three algorithms in the algos
 class flag(Enum):
@@ -17,6 +19,11 @@ class Bot:
     def __init__(self, algo="Random", **args) -> None:
         algos = ["MiniMax", "MCTS", "Random"]
         self.model = None
+        self.color = args['color']
+        self.play_by_book = args.get('play_by_book', False)
+        self.opening_book = self.load_opening_book('kasparov-deep-blue-1997.pgn')
+        self.book_index = 0
+        self.book_thresh = 6
 
         if algo not in algos:
             print(f"algo param should be one of {algos}")
@@ -31,19 +38,55 @@ class Bot:
         moves = [e for e in board.legal_moves]
         if len(moves) == 0:
             return
-        return random.choice([e for e in board.legal_moves])
+        return random.choice(moves)
     
-    def get_move(self, board):
+    def get_move(self, board: chess.Board):
+
+        if self.play_by_book and (self.book_index < self.book_thresh):
+            # Check if the current position exists in the opening book
+            book_move = self.get_book_move(board)
+            if book_move is not None:
+                self.book_index += 1
+                return book_move
+        
+        # If no book move, use the selected algorithm
         return self.model(board)
-        # model = eval(algo)()
+    
+    def load_opening_book(self, pgn_file):
+        opening_book = {}
+        with open(pgn_file, 'r') as f:
+            while True:
+                game = cpgn.read_game(f)
+                if game is None:
+                    break
+                board = game.board()
+                for move in game.mainline_moves():
+                    fen = board.fen()
+                    if fen not in opening_book:
+                        opening_book[fen] = []
+                    opening_book[fen].append(move)
+                    board.push(move)
+        return opening_book
+
+    def get_book_move(self, board):
+        # Check if the current position exists in the opening book
+        fen = board.fen()
+        if fen in self.opening_book:
+            # If the position is found in the opening book, return one of the book moves
+            return random.choice(self.opening_book[fen])
+        else:
+            # If the position is not in the opening book, return None
+            return None
 
 class MiniMax:
-    def __init__(self, depth=3, num_processes=4, multiprocess=False) -> None:
-        self.depth = depth
+    def __init__(self, **args) -> None:
+        self.depth = args.get('depth', 3)
+        self.num_processes = args.get('num_processes', 4)
+        self.multiprocess = args.get('multiprocess', False)
+
         self.evaluator = Evaluator()
-        self.num_processes = num_processes
+
         self.transpositionTableLookup: Dict[str, Entry] = {}
-        self.multiprocess = multiprocess
 
     def __call__(self, board: chess.Board):
         ts = time.time()
@@ -218,6 +261,10 @@ class Node:
         self.wins = 0
         self.visits = 0
         self.children: List[Node] = []
+        self.expanded = False
+
+    def all_children_visited(self):
+        return all(e.visits > 0 for e in self.children)
 
     def add_child(self, child_state, move):
         child = Node(child_state, self, move)
@@ -228,14 +275,25 @@ class Node:
         return max(self.children, key=lambda child: child.uct_value())
 
     def expand(self, moves):
+        if self.expanded:
+            return
+
         for move in moves:
             node = self.state.copy(stack=False)
             node.push(move)
             self.add_child(node, move)
 
+        self.expanded = True
+
     def update(self, result: chess.Color):
         self.visits += 1
-        self.wins += 1 if result == self.state.turn else 0
+
+        if result is None:
+            a = 0.5
+        else:
+            a = 1 if result == self.state.turn else 0
+
+        self.wins += a
 
     def uct_value(self) -> float:
         if self.visits == 0:
@@ -244,16 +302,21 @@ class Node:
 
 
 class MCTS:
-    def __init__(self):
+    def __init__(self, **args):
         self.nodes: Dict[str, Node] = {}
+        self.evaluator = Evaluator()
+        self.thread_flag = False
 
     def select(self, node: Node):
         current_node = node
-        while len(current_node.children) != 0:
+        while (len(current_node.children) != 0) and (current_node.all_children_visited()):
             current_node = current_node.select_child()
         return current_node
     
     def expand(self, node: Node):
+        if node.expanded:
+            return
+        
         node.expand(node.state.legal_moves)
         
         for e in node.children:
@@ -267,13 +330,37 @@ class MCTS:
             return node.outcome().winner
         
         moves = [e for e in node.legal_moves]
-        node.push(random.choice(moves))
+
+        move = max(moves, key=lambda x: self.evaluator.evaluate_action(node, x))
+        node.push(move)
+
+        # node.push(random.choice(moves))  # FUCK light playouts
+
         return self.simulate(node)
 
     def backpropagate(self, node: Node, result: chess.Color):
         while node is not None:
             node.update(result)
             node = node.parent
+
+    def mcts(self, root, iterations, thread=False):
+        if thread and self.thread_flag:
+            return
+        
+        if thread:
+            self.thread_flag = True
+
+        for iteration in range(iterations):
+            print(iteration, iterations)
+            node = self.select(root)
+            if node.state.is_game_over():
+                self.backpropagate(node, node.state.outcome().winner)
+            else:
+                self.expand(node)
+                result = self.simulate(node.state.copy(stack=False))
+                self.backpropagate(node, result)
+        
+        self.thread_flag = False
 
     def __call__(self, state: chess.Board, iterations=10) -> Node:
         if state.is_game_over():
@@ -283,18 +370,16 @@ class MCTS:
         if root is None:
             self.nodes[state.fen()] = Node(state)
             root = self.nodes[state.fen()]
+        
+        self.mcts(root, iterations)
+        move = max(root.children, key=lambda child: child.uct_value()).move
 
-        for iteration in range(iterations):
-            node = self.select(root)
-            if node.state.is_game_over():
-                self.backpropagate(node, node.state.outcome().winner)
-            else:
-                self.expand(node)
-                result = self.simulate(node.state.copy(stack=False))
-                self.backpropagate(node, result)
+        # if not self.thread_flag:
+        #     thread = threading.Thread(target=self.mcts, args=(root, 1000, True))
+        #     thread.start()
+        # thread.join()
 
-        visited_children = [e for e in root.children if e.visits > 0]
-        return max(visited_children, key=lambda child: child.wins / child.visits).move  # No exploration
+        return move # No exploration
         # return max(root.children, key=lambda child: child.wins / child.visits).move  # No exploration
 
 

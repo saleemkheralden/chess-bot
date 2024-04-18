@@ -26,6 +26,9 @@ class Evaluator:
     def evaluate_position(self, position: chess.Board):
         score = 0
 
+        if position.is_stalemate() or position.is_variant_draw():
+            return score
+
         # Check for checkmate
         if position.is_checkmate():
             return -self.checkmate_score if position.turn == chess.WHITE else self.checkmate_score
