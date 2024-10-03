@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt5.QtCore import QTimer
 import sys
 from Bot import Bot
+from time import sleep
 
 class MainWindow(QWidget):
     def __init__(self, board):
@@ -104,11 +105,14 @@ if __name__ == "__main__":
             timer.stop()  # Stop the timer when all moves are done
             print("END")
             print(board.outcome())
+            window.set_board(board)
+            sleep(2)
             board.reset()
             exit(1)
 
         # Start the timer for the next move with a delay of 800 milliseconds
-        timer.start(800)
+        timer.start(1)
+        # timer.start(800)
 
     # Connect the timer to the function to perform moves
     timer.timeout.connect(perform_moves)
